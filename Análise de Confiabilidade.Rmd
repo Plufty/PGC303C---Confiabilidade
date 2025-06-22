@@ -1,0 +1,338 @@
+---
+title: "Relatório de Confiabilidade"
+output: pdf_document
+---
+
+```{r}
+# 1. Carregar pacotes necessários
+pacotes <- c("tidyverse", "lubridate", "fitdistrplus", "ggplot2", "goftest")
+invisible(lapply(pacotes, function(p) if (!require(p, character.only = TRUE)) install.packages(p)))
+
+library(tidyverse)
+library(lubridate)
+library(fitdistrplus)
+library(ggplot2)
+library(goftest)
+
+# 2. Função para montar caminho do arquivo
+get_file_path <- function(nome_arquivo) {
+  base_dir <- "C:\\Users\\Plufty\\Desktop\\UFU\\2025-1\\303C - Engenharia de Confiabilidade\\Trabalho Final\\Código"
+  file.path(base_dir, nome_arquivo)
+}
+
+# 3. Configuração padrão
+timestamp_column_name <- "DataHora"
+date_format <- "dmy_hms"  # usado com lubridate
+
+```
+
+```{r}
+# Função: calcula TBF
+calcular_tbf <- function(caminho_csv, timestamp_col, formato_data = "dmy_hms") {
+  if (!file.exists(caminho_csv)) stop("Arquivo não encontrado.")
+  
+  df <- read_csv(caminho_csv, show_col_types = FALSE)
+  if (!(timestamp_col %in% colnames(df))) stop("Coluna de timestamp não encontrada.")
+
+  df %>%
+    mutate(Timestamp = do.call(formato_data, list(.data[[timestamp_col]]))) %>%
+    arrange(Timestamp) %>%
+    mutate(TBF_dias = as.numeric(difftime(Timestamp, lag(Timestamp), units = "days"))) %>%
+    filter(!is.na(TBF_dias) & TBF_dias > 0)
+}
+
+```
+
+
+```{r}
+# Para gráficos base R
+salvar_pdf_base <- function(expr, nome_arquivo, largura = 8, altura = 8) {
+  base_dir <- getwd()  # ← aqui
+  caminho <- file.path(base_dir, nome_arquivo)
+  pdf(caminho, width = largura, height = altura)
+  expr()
+  dev.off()
+  message("Gráfico base R salvo em: ", caminho)
+}
+
+# Para ggplot2
+salvar_pdf_ggplot <- function(plot_obj, nome_arquivo, largura = 8, altura = 6) {
+  base_dir <- getwd()  # ← aqui
+  caminho <- file.path(base_dir, nome_arquivo)
+  ggsave(filename = caminho, plot = plot_obj, width = largura, height = altura)
+  message("Gráfico ggplot2 salvo em: ", caminho)
+}
+
+```
+```{r}
+# Ajuste os modelos principais de confiabilidade
+ajustar_modelos <- function(tbf_col) {
+  list(
+    exp = fitdist(tbf_col, "exp"),
+    norm = fitdist(tbf_col, "norm"),
+    weibull = fitdist(tbf_col, "weibull"),
+    lnorm = fitdist(tbf_col, "lnorm"),
+    gamma = fitdist(tbf_col, "gamma")
+  )
+}
+
+```
+
+```{r}
+plot_modelos <- function(modelos, legendas) {
+  par(mfrow = c(2, 2))
+  denscomp(modelos, legendtext = legendas)
+  qqcomp(modelos, legendtext = legendas)
+  cdfcomp(modelos, legendtext = legendas)
+  ppcomp(modelos, legendtext = legendas)
+  par(mfrow = c(1, 1))
+}
+
+```
+
+
+```{r}
+avaliar_modelos <- function(modelos) {
+  nomes <- names(modelos)
+  gof <- gofstat(modelos, fitnames = nomes)
+  
+  results_df <- data.frame(
+    Modelo = nomes,
+    AIC = gof$aic,
+    KS = gof$ks,
+    AD = gof$ad
+  ) %>%
+    mutate(
+      Rank_AIC = rank(AIC, ties.method = "min"),
+      Rank_KS = rank(KS, ties.method = "min"),
+      Rank_AD = rank(AD, ties.method = "min"),
+      Score_Final = Rank_AIC + Rank_KS + Rank_AD
+    ) %>%
+    arrange(Score_Final, AIC)
+  
+  list(gof = gof, ranking = results_df)
+}
+
+```
+
+
+
+```{r}
+analisar_modelos_detalhadamente <- function(modelos, tbf_col, avaliacao) {
+  cat("\n\n========= ANÁLISE NUMÉRICA DETALHADA POR MODELO =========\n")
+  
+  for (nome in names(modelos)) {
+    modelo <- modelos[[nome]]
+    params <- as.list(modelo$estimate)
+    loglik <- modelo$loglik
+    aic <- AIC(modelo)
+    bic <- BIC(modelo)
+
+    #cat("\nModelo:", toupper(nome))
+    cat(paste("====== Testes para o Modelo:", toupper(nome), "======\n"))
+    cat("\nParâmetros:\n----------------------------\n")
+    print(round(unlist(params), 4))
+    cat("\n----------------------------\nLog-likelihood:", round(loglik, 2), "\n")
+    cat("AIC[stats] Calculado Individualmente:", round(aic, 2), " \nBIC[stats] Calculado Individualmente:", round(bic, 2), "\n")
+
+    # Teste de Kolmogorov-Smirnov com os parâmetros do modelo
+    ks <- suppressWarnings(
+      do.call(stats::ks.test, c(
+        list(x = tbf_col, y = paste0("p", nome)),
+        params
+      ))
+    )
+  
+    cat(paste("Teste KS[stats]: Estatística D =", round(ks$statistic, 4), 
+            "| p-value =", format.pval(ks$p.value, digits=4), "\n"))
+    
+    # Teste Anderson-Darling com os parâmetros do model
+    tryCatch({
+      ad <- do.call(goftest::ad.test, c(
+        list(x = tbf_col, null = paste0("p", nome)),
+        params
+      ))
+      cat(paste("Teste AD[goftest]: Estatística A =", round(ad$statistic, 4), "\n"))
+    }, error = function(e) {
+      cat("Teste AD: Não aplicável para este modelo com os parâmetros fornecidos.\n")
+    })
+    
+    # Configura a área de plot com 2x2 painéis e plota os 4 gráficos padrão do fitdist e adiciona o título centralizado sobre os gráficos
+    par(mfrow = c(2, 2), oma = c(0, 0, 3, 0))  # oma reserva espaço para o título
+    plot(modelo)
+    mtext(paste("Modelo Ajustado:", toupper(nome)), outer = TRUE, cex = 1.2, line = 1.5)
+    nome_plot <- paste0("modelo_", nome, "_ajuste_individual.pdf")
+  salvar_pdf_base(function() {
+    par(mfrow = c(2, 2), oma = c(0, 0, 3, 0))
+    plot(modelo)
+    mtext(paste("Modelo Ajustado:", toupper(nome)), outer = TRUE, cex = 1.2, line = 1.5)
+  }, nome_plot)
+  }
+  
+  cat("\n\n========= ANÁLISE GOF[FITDISTRPLUS] =========\n\n")
+  print(avaliacao$gof)
+}
+
+```
+
+
+```{r}
+gerar_metricas_confiabilidade <- function(modelo_ajustado, modelo_nome, tbf_data, avaliacao) {
+  params <- as.list(modelo_ajustado$estimate)
+  
+  mtbf_estimado <- switch(modelo_nome,
+    exp = 1 / params$rate,
+    norm = params$mean,
+    weibull = params$scale * gamma(1 + 1 / params$shape),
+    lnorm = exp(params$meanlog + 0.5 * params$sdlog^2),
+    gamma = params$shape / params$rate,
+    NA  # caso modelo desconhecido
+  )
+  
+  # Cálculo do MTTF como a integral de R(t)
+  #mttf <- tryCatch({
+  #  integrate(confiabilidade_func, lower = 0, upper = Inf)$value
+  #}, error = function(e) NA)
+  
+
+  
+  confiabilidade_func <- function(t) 1 - do.call(paste0("p", modelo_nome), c(list(q = t), params))
+  taxa_falha_func <- function(t) {
+    pdf <- do.call(paste0("d", modelo_nome), c(list(x = t), params))
+    conf <- confiabilidade_func(t)
+    return(pdf / conf)
+  }
+  vida_bx_func <- function(x) do.call(paste0("q", modelo_nome), c(list(p = x / 100), params))
+
+  mtbf <- mean(tbf_data$TBF_dias)
+  
+  max_tempo <- quantile(tbf_data$TBF_dias, 0.999) #Tempo até o momento em que 99.9% das falhas já ocorreram
+  mttf <- integrate(confiabilidade_func, lower = 0, upper = max_tempo)$value
+  
+  unreliability_func <- function(t) do.call(paste0("p", modelo_nome), c(list(q = t), params))
+  H_t_func <- function(t) -log(1 - unreliability_func(t))
+  #mttr <- 5  # poderia inserir manualmente o mttr, mas como não tenho o MTTR, utilizarei o MTBF  como denominador pois A = MTTF/MTTR+MTTF e MTBF = MTTR+MTTF
+  
+
+  disponibilidade <- mttf / mtbf #(mtbf + mttr)
+  #A_t_func <- function(t) disponibilidade * (1 - exp(-t * (1/mtbf + 1/mttr)))
+
+
+  cat("\n\n========= MÉTRICAS DE CONFIABILIDADE =========\n\n\n")
+  
+  rank_aic <- avaliacao$ranking$Rank_AIC[1]
+  rank_ks  <- avaliacao$ranking$Rank_KS[1]
+  rank_ad  <- avaliacao$ranking$Rank_AD[1]
+  melhor_modelo <- avaliacao$ranking$Modelo[1]
+  
+  
+  cat(sprintf("O melhor modelo, com base no ranking combinado (AIC: %dº lugar, KS: %dº lugar, AD: %dº lugar), foi: %s\n",
+              rank_aic, rank_ks, rank_ad, toupper(melhor_modelo)))
+
+  cat("\n\nModelo:", toupper(modelo_nome), "\n")
+  cat("\n\nParâmetros Estimados:\n")
+  print(round(unlist(params), 4)) 
+  cat(sprintf("Mean Time Between Failures = MTBF Amostral: %.2f dias\n", mtbf))
+  cat(sprintf("Mean Time Between Failures = MTBF Estimado (%s): %.2f dias\n", toupper(modelo_nome), mtbf_estimado))
+  cat(sprintf("Reliability = R(30 dias): %.2f %%\n", confiabilidade_func(30) * 100))
+  cat(sprintf("Reliability = R(90 dias): %.2f %%\n", confiabilidade_func(90) * 100))
+  cat(sprintf("Unreliability = U(30 dias): %.2f %%\n", unreliability_func(30) * 100))
+  cat(sprintf("Unreliability = U(90 dias): %.2f %%\n", unreliability_func(90) * 100))
+  cat(sprintf("Vida B10: %.2f dias\n", vida_bx_func(10)))
+  cat(sprintf("Mean Time To Failure = MTTF (via integral de R(t)dt$): %.2f dias", mttf))
+  cat(sprintf("Taxa de falha acumulada H(30): %.4f\n", H_t_func(30)))
+  cat(sprintf("Taxa de falha acumulada H(90): %.4f\n", H_t_func(90)))
+  cat(sprintf("Disponibilidade estimada: %.2f %% (MTTF = %.2f, MTBF = %.2f)\n", disponibilidade * 100, mttf, mtbf))
+
+  # Plot confiabilidade vs taxa de falha
+  tempo <- seq(0.1, quantile(tbf_data$TBF_dias, 0.99), length.out = 200)
+  plot_df <- data.frame(
+    Tempo = tempo,
+    Confiabilidade = confiabilidade_func(tempo),
+    Taxa_de_Falha = taxa_falha_func(tempo)
+  )
+  escala <- max(plot_df$Taxa_de_Falha, na.rm = TRUE)
+
+  p1 <- ggplot(plot_df, aes(x = Tempo)) +
+    geom_line(aes(y = Confiabilidade), color = "blue", linewidth = 1.2) +
+    geom_line(aes(y = Taxa_de_Falha / escala), color = "red", linetype = "dashed", linewidth = 1.2) +
+    scale_y_continuous(
+      name = "Confiabilidade R(t) [Azul]",
+      sec.axis = sec_axis(~ . * escala, name = "Taxa de Falha h(t) [Vermelha]")
+    ) +
+    labs(title = paste("Confiabilidade vs Taxa de Falha - Modelo:", toupper(modelo_nome)), x = "Tempo (dias)") +
+    theme_minimal()
+  
+  
+    
+  
+  
+  
+  
+  
+  
+  
+  # Gera vetor de tempos para plotar, por exemplo de 0 até o percentil 99% dos dados
+  #tempo <- seq(0, quantile(tbf_data$TBF_dias, 0.99), length.out = 200)
+  
+  # Calcula H(t) para cada tempo
+  H_values <- H_t_func(tempo)
+  
+  # Data frame para ggplot
+  df_hazard_cum <- data.frame(Tempo = tempo, CumulativeHazard = H_values)
+  
+    p2 <- ggplot(df_hazard_cum, aes(x = Tempo, y = CumulativeHazard)) +
+    geom_line(color = "red", linewidth = 1.2) +
+    geom_point(data = data.frame(Tempo = tbf_data$TBF_dias, CumulativeHazard = H_t_func(tbf_data$TBF_dias)),
+           aes(x = Tempo, y = CumulativeHazard),
+           color = "blue", size = 3, shape = 1, stroke = 1) +
+    labs(title = paste("Taxa de Falhas Cumulativa H(t) - Modelo", toupper(modelo_nome)),
+         x = "Tempo (dias)",
+         y = "Taxa de Falhas Cumulativa H(t)") +
+    theme_minimal()
+    
+  
+  
+  print(p1)
+  print(p2)
+  
+  salvar_pdf_ggplot(p1, paste0("plot_confiabilidade_", modelo_nome, ".pdf"))
+  salvar_pdf_ggplot(p2, paste0("plot_taxa_falha_", modelo_nome, ".pdf"))
+  
+  
+
+
+}
+
+```
+
+```{r}
+# Arquivo a ser analisado
+#arquivo_csv <- get_file_path("Visualization Filtrado.csv")
+arquivo_csv <- get_file_path("Search Filtrado.csv")
+tbf_data <- calcular_tbf(arquivo_csv, timestamp_column_name)
+
+modelos <- ajustar_modelos(tbf_data$TBF_dias)
+
+plot_modelos(modelos, c("Exponencial", "Normal", "Weibull", "Lognormal", "Gamma"))
+
+# Avaliação e ranking
+avaliacao <- avaliar_modelos(modelos)
+print(avaliacao$ranking)
+
+
+# =================== RANKING E MELHOR MODELO ===================
+# Análise numérica completa por modelo
+analisar_modelos_detalhadamente(modelos, tbf_data$TBF_dias, avaliacao)
+
+# Métricas e visualização do melhor modelo
+melhor_modelo_nome <- tolower(trimws(avaliacao$ranking$Modelo[1]))
+melhor_modelo_ajustado <- modelos[[melhor_modelo_nome]]
+
+gerar_metricas_confiabilidade(melhor_modelo_ajustado, melhor_modelo_nome, tbf_data,avaliacao)
+
+
+```
+
+
+
